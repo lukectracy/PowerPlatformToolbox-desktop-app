@@ -1536,7 +1536,7 @@ class ToolBoxApp {
             if (senderToolId) {
                 const terminal = this.terminalManager.getTerminal(terminalId);
                 if (!terminal || terminal.toolId !== senderToolId) {
-                    throw new Error(`Terminal ${terminalId} not found or not accessible by the calling tool`);
+                    throw new Error(`Terminal ${terminalId} not accessible`);
                 }
             }
             return await this.terminalManager.executeCommand(terminalId, command);

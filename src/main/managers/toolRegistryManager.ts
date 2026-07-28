@@ -625,15 +625,21 @@ export class ToolRegistryManager extends EventEmitter {
             throw new Error(`[ToolRegistry] Cannot install tool: registry did not supply a checksum for ${path.basename(filePath, ".tar.gz")}`);
         }
 
-        const hash = createHash("sha256");
-        await pipeline(createReadStream(filePath), hash);
-        const actual = hash.digest("hex");
-
-        if (actual !== expectedChecksum) {
-            throw new Error(`[ToolRegistry] Checksum mismatch for ${path.basename(filePath, ".tar.gz")}: expected ${expectedChecksum}, got ${actual}`);
+        const toolName = path.basename(filePath, ".tar.gz");
+        let actual: string;
+        try {
+            const hash = createHash("sha256");
+            await pipeline(createReadStream(filePath), hash);
+            actual = hash.digest("hex");
+        } catch (err) {
+            throw new Error(`[ToolRegistry] Failed to compute checksum for ${toolName}: ${err instanceof Error ? err.message : String(err)}`);
         }
 
-        logInfo(`[ToolRegistry] Checksum verified for ${path.basename(filePath, ".tar.gz")}`);
+        if (actual !== expectedChecksum) {
+            throw new Error(`[ToolRegistry] Checksum mismatch for ${toolName}: expected ${expectedChecksum}, got ${actual}`);
+        }
+
+        logInfo(`[ToolRegistry] Checksum verified for ${toolName}`);
     }
 
     /**
