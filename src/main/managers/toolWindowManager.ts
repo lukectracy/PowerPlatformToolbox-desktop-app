@@ -363,10 +363,9 @@ export class ToolWindowManager {
                     // Disable Electron sandbox for this BrowserView preload so CommonJS require works.
                     // If stronger isolation is needed later, switch to bundling preload without runtime require.
                     sandbox: false,
-                    // Disable web security to bypass CORS for external API calls
-                    // CSP is still enforced via meta tags in tool HTML
-                    webSecurity: false,
-                    // Allow tools to load external resources
+                    // External API calls that require CORS bypass must be routed through the
+                    // existing main-process IPC brokers (DATAVERSE_CHANNELS, POWERPLATFORM_CHANNELS).
+                    // Keeping webSecurity enabled prevents renderer-side SSRF against local services.
                     allowRunningInsecureContent: false,
                 },
             });
