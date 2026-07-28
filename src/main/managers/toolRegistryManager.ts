@@ -1,8 +1,9 @@
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
+import { createHash } from "crypto";
 import { EventEmitter } from "events";
 import * as fs from "fs";
-import { createWriteStream } from "fs";
-import * as http from "http";
+import { createReadStream, createWriteStream } from "fs";
+import type { IncomingMessage } from "http";
 import * as https from "https";
 import * as path from "path";
 import { pipeline } from "stream/promises";
@@ -392,8 +393,7 @@ export class ToolRegistryManager extends EventEmitter {
         logInfo(`[ToolRegistry] Fetching registry from Azure Blob: ${registryUrl}`);
 
         const rawJson = await new Promise<string>((resolve, reject) => {
-            const protocol = registryUrl.startsWith("https") ? https : http;
-            protocol
+            https
                 .get(registryUrl, (res) => {
                     if (res.statusCode !== 200) {
                         reject(new Error(`Azure Blob registry request failed: HTTP ${res.statusCode} for ${registryUrl}`));
@@ -527,35 +527,42 @@ export class ToolRegistryManager extends EventEmitter {
     }
 
     /**
-     * Download a tool from the registry
+     * Download a tool from the registry.
+     * Only HTTPS download URLs are accepted to prevent on-path substitution attacks.
+     * After download the archive is verified against the registry checksum before extraction.
      */
     async downloadTool(tool: ToolRegistryEntry): Promise<string> {
         const toolPath = path.join(this.toolsDirectory, tool.id);
         const downloadPath = path.join(this.toolsDirectory, `${tool.id}.tar.gz`);
 
+        if (!tool.downloadUrl.startsWith("https://")) {
+            throw new Error(`[ToolRegistry] Refusing to download tool ${tool.id}: only HTTPS download URLs are allowed`);
+        }
+
         logInfo(`[ToolRegistry] Downloading tool ${tool.id} from ${tool.downloadUrl}`);
 
         return new Promise((resolve, reject) => {
-            const protocol = tool.downloadUrl.startsWith("https") ? https : http;
-
-            protocol
+            https
                 .get(tool.downloadUrl, (res) => {
                     if (res.statusCode === 302 || res.statusCode === 301) {
-                        // Handle redirects
+                        // Handle redirects — redirect target must also use HTTPS
                         const redirectUrl = res.headers.location;
                         if (redirectUrl) {
+                            if (!redirectUrl.startsWith("https://")) {
+                                reject(new Error(`[ToolRegistry] Refusing redirect to non-HTTPS URL for tool ${tool.id}`));
+                                return;
+                            }
                             logInfo(`[ToolRegistry] Following redirect to ${redirectUrl}`);
-                            const redirectProtocol = redirectUrl.startsWith("https") ? https : http;
-                            redirectProtocol
+                            https
                                 .get(redirectUrl, (redirectRes) => {
-                                    this.handleDownloadResponse(redirectRes, downloadPath, toolPath, resolve, reject);
+                                    this.handleDownloadResponse(redirectRes, downloadPath, toolPath, tool.checksum, resolve, reject);
                                 })
                                 .on("error", reject);
                         } else {
                             reject(new Error("Redirect without location header"));
                         }
                     } else {
-                        this.handleDownloadResponse(res, downloadPath, toolPath, resolve, reject);
+                        this.handleDownloadResponse(res, downloadPath, toolPath, tool.checksum, resolve, reject);
                     }
                 })
                 .on("error", (error) => {
@@ -565,9 +572,9 @@ export class ToolRegistryManager extends EventEmitter {
     }
 
     /**
-     * Handle the download response
+     * Handle the download response — writes to disk, verifies checksum, then extracts.
      */
-    private handleDownloadResponse(res: http.IncomingMessage, downloadPath: string, toolPath: string, resolve: (path: string) => void, reject: (error: Error) => void): void {
+    private handleDownloadResponse(res: IncomingMessage, downloadPath: string, toolPath: string, checksum: string | undefined, resolve: (path: string) => void, reject: (error: Error) => void): void {
         if (res.statusCode !== 200) {
             reject(new Error(`Failed to download: HTTP ${res.statusCode}`));
             return;
@@ -577,7 +584,21 @@ export class ToolRegistryManager extends EventEmitter {
             const fileStream = createWriteStream(downloadPath);
 
             pipeline(res, fileStream)
-                .then(() => {
+                .then(async () => {
+                    // Verify the downloaded archive against the registry checksum before
+                    // extraction.  An absent checksum is treated as untrusted and rejected.
+                    try {
+                        await this.verifyChecksum(downloadPath, checksum);
+                    } catch (checksumError) {
+                        try {
+                            fs.unlinkSync(downloadPath);
+                        } catch {
+                            // best-effort cleanup
+                        }
+                        reject(checksumError instanceof Error ? checksumError : new Error(String(checksumError)));
+                        return;
+                    }
+
                     logInfo(`[ToolRegistry] Download complete, extracting to ${toolPath}`);
                     this.extractTool(downloadPath, toolPath)
                         .then(() => {
@@ -593,6 +614,26 @@ export class ToolRegistryManager extends EventEmitter {
         } catch (err) {
             reject(new Error(`Failed to download tool: ${err}`));
         }
+    }
+
+    /**
+     * Compute the SHA-256 hash of a file and compare it against the expected checksum.
+     * Rejects if the checksum is absent (registry must supply one) or if the values differ.
+     */
+    private async verifyChecksum(filePath: string, expectedChecksum: string | undefined): Promise<void> {
+        if (!expectedChecksum) {
+            throw new Error(`[ToolRegistry] Cannot install tool: registry did not supply a checksum for ${path.basename(filePath, ".tar.gz")}`);
+        }
+
+        const hash = createHash("sha256");
+        await pipeline(createReadStream(filePath), hash);
+        const actual = hash.digest("hex");
+
+        if (actual !== expectedChecksum) {
+            throw new Error(`[ToolRegistry] Checksum mismatch for ${path.basename(filePath, ".tar.gz")}: expected ${expectedChecksum}, got ${actual}`);
+        }
+
+        logInfo(`[ToolRegistry] Checksum verified for ${path.basename(filePath, ".tar.gz")}`);
     }
 
     /**
