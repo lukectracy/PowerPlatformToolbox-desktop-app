@@ -1519,31 +1519,78 @@ class ToolBoxApp {
         });
 
         // Terminal handlers
-        ipcMain.handle(TERMINAL_CHANNELS.CREATE_TERMINAL, async (_, toolId, instanceId, options) => {
-            return await this.terminalManager.createTerminal(toolId, instanceId ?? null, options);
+        // Ownership rules mirror the filesystem handlers above:
+        // when the caller is a tool window, derive and enforce identity from event.sender
+        // rather than trusting caller-supplied toolId/instanceId values.
+        ipcMain.handle(TERMINAL_CHANNELS.CREATE_TERMINAL, async (event, _callerToolId, _callerInstanceId, options) => {
+            // Derive toolId and instanceId from the sender WebContents so a tool cannot
+            // create terminals attributed to a different tool.
+            const senderInstanceId = this.toolWindowManager?.getInstanceIdByWebContents(event.sender.id) ?? null;
+            const senderToolId = this.toolWindowManager?.getToolIdByWebContents(event.sender.id) ?? (_callerToolId as string);
+            return await this.terminalManager.createTerminal(senderToolId, senderInstanceId, options);
         });
 
-        ipcMain.handle(TERMINAL_CHANNELS.EXECUTE_COMMAND, async (_, terminalId, command) => {
+        ipcMain.handle(TERMINAL_CHANNELS.EXECUTE_COMMAND, async (event, terminalId, command) => {
+            // Validate that the calling tool owns the target terminal.
+            const senderToolId = this.toolWindowManager?.getToolIdByWebContents(event.sender.id);
+            if (senderToolId) {
+                const terminal = this.terminalManager.getTerminal(terminalId);
+                if (!terminal || terminal.toolId !== senderToolId) {
+                    throw new Error(`Terminal ${terminalId} not found or not accessible by the calling tool`);
+                }
+            }
             return await this.terminalManager.executeCommand(terminalId, command);
         });
 
-        ipcMain.handle(TERMINAL_CHANNELS.CLOSE_TERMINAL, (_, terminalId) => {
+        ipcMain.handle(TERMINAL_CHANNELS.CLOSE_TERMINAL, (event, terminalId) => {
+            // Only allow a tool to close its own terminals.
+            const senderToolId = this.toolWindowManager?.getToolIdByWebContents(event.sender.id);
+            if (senderToolId) {
+                const terminal = this.terminalManager.getTerminal(terminalId);
+                if (!terminal || terminal.toolId !== senderToolId) {
+                    return;
+                }
+            }
             this.terminalManager.closeTerminal(terminalId);
         });
 
-        ipcMain.handle(TERMINAL_CHANNELS.GET_TERMINAL, (_, terminalId) => {
+        ipcMain.handle(TERMINAL_CHANNELS.GET_TERMINAL, (event, terminalId) => {
+            // Return the terminal only if the caller owns it.
+            const senderToolId = this.toolWindowManager?.getToolIdByWebContents(event.sender.id);
+            if (senderToolId) {
+                const terminal = this.terminalManager.getTerminal(terminalId);
+                if (!terminal || terminal.toolId !== senderToolId) {
+                    return undefined;
+                }
+                return terminal;
+            }
             return this.terminalManager.getTerminal(terminalId);
         });
 
-        ipcMain.handle(TERMINAL_CHANNELS.GET_TOOL_TERMINALS, (_, toolId, instanceId) => {
-            return this.terminalManager.getToolTerminals(toolId, instanceId ?? null);
+        ipcMain.handle(TERMINAL_CHANNELS.GET_TOOL_TERMINALS, (event, _callerToolId, instanceId) => {
+            // Override caller-supplied toolId with the one derived from the sender.
+            const senderToolId = this.toolWindowManager?.getToolIdByWebContents(event.sender.id) ?? (_callerToolId as string);
+            return this.terminalManager.getToolTerminals(senderToolId, instanceId ?? null);
         });
 
-        ipcMain.handle(TERMINAL_CHANNELS.GET_ALL_TERMINALS, () => {
+        ipcMain.handle(TERMINAL_CHANNELS.GET_ALL_TERMINALS, (event) => {
+            // Tool windows may only enumerate their own terminals.
+            const senderToolId = this.toolWindowManager?.getToolIdByWebContents(event.sender.id);
+            if (senderToolId) {
+                return this.terminalManager.getToolTerminals(senderToolId, null);
+            }
             return this.terminalManager.getAllTerminals();
         });
 
-        ipcMain.handle(TERMINAL_CHANNELS.SET_VISIBILITY, (_, terminalId, visible) => {
+        ipcMain.handle(TERMINAL_CHANNELS.SET_VISIBILITY, (event, terminalId, visible) => {
+            // Only the owning tool may change visibility of a terminal.
+            const senderToolId = this.toolWindowManager?.getToolIdByWebContents(event.sender.id);
+            if (senderToolId) {
+                const terminal = this.terminalManager.getTerminal(terminalId);
+                if (!terminal || terminal.toolId !== senderToolId) {
+                    return;
+                }
+            }
             this.terminalManager.setTerminalVisibility(terminalId, visible);
         });
 
